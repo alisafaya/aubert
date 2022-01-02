@@ -37,7 +37,7 @@ rm medium.tar
 python scripts/cut_by_vad.py --input_dir medium/ --output_dir cut-medium/
 ```
 
-- Download LibriVox books raw text [here](), and place under `data/`:
+- Download LibriVox books raw text [here](https://drive.google.com/file/d/12gVt7Pr3KdLWFnnVdw81ygugJEQk46le/view?usp=sharing), and place under `data/`:
 
 ```
 mkdir bin/
