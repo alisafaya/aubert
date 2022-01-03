@@ -15,6 +15,7 @@ from multiprocessing import Pool
 from tqdm import tqdm
 
 from nltk.util import ngrams
+from functools import partial
 
 import soundfile as sf
 import numpy as np
@@ -130,14 +131,12 @@ def prepare_audio_input(audios, args):
         processor = Wav2Vec2Processor.from_pretrained(args.audio_processor)
 
     encoded = processor(audios, return_tensors="pt", sampling_rate=16000, padding='longest')
-
     return encoded
 
 
 def prepare_speaker_ngram_data(instances, args):
 
     ngrams, contexts, audios = list(zip(*instances))
-
     text_encoded, span_indices = prepare_text_input(contexts, args)
     audio_encoded = prepare_audio_input(audios, args)
 
@@ -154,10 +153,13 @@ def collate_single_ngram(tup, speaker_data, raw_books, args):
     instances = []
     for i, j, ngram_size in indices:
         alignments = speaker_data[i]['words']
-        audio_data = sf.read(os.path.join(args.audio_dir, speaker_data[i]['fname'].split("/")[-1]))[0]
         _, start_idx, _, audio_starts, _ = alignments[j]
         _, _, end_idx, _, audio_ends = alignments[j + ngram_size - 1]
 
+        if (audio_ends - audio_starts) < args.min_audio_length:
+            continue
+
+        audio_data = sf.read(os.path.join(args.audio_dir, speaker_data[i]['fname'].split("/")[-1]))[0]
         relative_start_idx = start_idx - max(0, start_idx - 512)
         relative_end_idx = end_idx - max(0, start_idx - 512)
 
@@ -166,9 +168,14 @@ def collate_single_ngram(tup, speaker_data, raw_books, args):
 
         instances.append((ngram, context_window, audio_segment))
 
-    return prepare_speaker_ngram_data(instances, args)
+        # DEBUG
+        # if i < 3:
+            # sf.write(os.path.join("bin/temp-audio", "%s_%d.wav" % (ngram, i)), audio_segment, 16000)
 
-from functools import partial
+    if instances:
+        return prepare_speaker_ngram_data(instances, args)
+    else:
+        return []
 
 def collate_speaker_data(speaker_data, raw_books, args, pool):
 
@@ -191,7 +198,9 @@ def collate_speaker_data(speaker_data, raw_books, args, pool):
 
     for ngram_data in tqdm(pool.imap_unordered(partial(collate_single_ngram, speaker_data=speaker_data, raw_books=raw_books, args=args), speaker_vocab_map), 
                             total=len(speaker_vocab_map)):
-        data_instances.append(ngram_data)
+        if ngram_data:
+            data_instances.append(ngram_data)
+        
         if len(data_instances) == args.chunk_size:
             yield data_instances
             data_instances = []
@@ -218,9 +227,10 @@ if __name__ == '__main__':
     argparser.add_argument('--chunk-size', type=int, default=512, help='The max samples to save at a data batch')
     argparser.add_argument('--max-seq-length', type=int, default=256, help='The maximum sequence length of utterance contexts')
     argparser.add_argument('--mask-ratio', type=float, default=0.1, help='The ratio of masked tokens in the input sequence')
-    argparser.add_argument('--max-ngram-size', type=int, default=3, help='The size of n-grams to use for pre-training AuBERT')
+    argparser.add_argument('--max-ngram-size', type=int, default=4, help='The size of n-grams to use for pre-training AuBERT')
     argparser.add_argument('--min-utter-per-speaker', type=int, default=100, help='The minimum number of utterances per speaker to include in the dataset')
     argparser.add_argument('--min-ngram-occurrences', type=int, default=10, help='The minimum number of times a n-gram must occur in the dataset to be included')
+    argparser.add_argument('--min-audio-length', type=int, default=400, help='The minimum length of audio segments to include in the dataset')
     argparser.add_argument('--max-samples-per-ngram', type=int, default=128, help='The maximum number of samples per n-gram to include in the dataset')
     argparser.add_argument('--num-workers', type=int, default=8, help='The number of workers to use for data loading')
     argparser.add_argument('--output-dir', type=str, help='Directory to save the output')
@@ -241,9 +251,18 @@ if __name__ == '__main__':
 
     # Create the pool of workers
     with Pool(args.num_workers) as pool:
+        total_vocab, total_samples = 0, 0
         for speaker in speakers:
             speaker_data = collate_speaker_data(speakers[speaker], raw_books, args, pool)
             for i, chunk in enumerate(speaker_data):
                 torch.save(chunk, os.path.join(args.output_dir, speaker + f".{i}.pt"))
-                logging.info("Saved chunk %d for speaker %s" % (i, speaker))
+                logger.info("Saved chunk %d for speaker %s" % (i, speaker))
+                total_vocab += len(chunk)
+                total_samples += sum([len(x['spans']) for x in chunk])
 
+    logger.info("Total vocab size: %d" % total_vocab)
+    logger.info("Average vocab size per speaker: %d" % (total_vocab / len(speakers)))
+    logger.info("Total samples: %d" % total_samples)
+    logger.info("Average samples per speaker: %d" % (total_samples / len(speakers)))
+    logger.info("Average samples per vocab: %d" % (total_samples / total_vocab))
+    logger.info("Done!")
