@@ -73,23 +73,52 @@ python scripts/match_utterances_to_books.py -u bin/medium_transcriptions.tsv -p 
 python scripts/refine_alignments.py -i alignments/ -o alignments/
 ```
 
-- Apply alignment for on word level using Kaldi:
+- Apply alignment for on word level:
 
 ```
-
+python scripts/align_words.py -i alignments/ -o data/aligned/
 ```
 
 ## Running Pre-training 
 
-```
-
-
+- First prepare the data batches for pre-training
 
 ```
+python aubert/prepare_data.py --alignments data/aligned/ --output-dir bin/out-data/ --max-ngram-size 3 --audio-dir cut-medium/
+```
+
+Arguments:
+
+```
+  --alignments ALIGNMENTS
+                        Directory to The JSON files for word-level aligned book data as prepared in the preprocessing step
+  --audio-dir AUDIO_DIR
+                        Directory to the audio files
+  --audio-processor AUDIO_PROCESSOR
+                        The audio processor to use for preprocessing and padding audio segments
+  --chunk-size CHUNK_SIZE
+                        The max samples to save at a data batch
+  --max-seq-length MAX_SEQ_LENGTH
+                        The maximum sequence length of utterance contexts
+  --mask-ratio MASK_RATIO
+                        The ratio of masked tokens in the input sequence
+  --max-ngram-size MAX_NGRAM_SIZE
+                        The size of n-grams to use for pre-training AuBERT
+  --min-utter-per-speaker MIN_UTTER_PER_SPEAKER
+                        The minimum number of utterances per speaker to include in the dataset
+  --min-ngram-occurrences MIN_NGRAM_OCCURRENCES
+                        The minimum number of times a n-gram must occur in the dataset to be included
+  --max-samples-per-ngram MAX_SAMPLES_PER_NGRAM
+                        The maximum number of samples per n-gram to include in the dataset
+  --output-dir OUTPUT_DIR
+                        Directory to save the output
+  --tokenizer TOKENIZER
+                        The tokenizer to use for tokenization
+```
+
 
 ## Evaluation
 
 ```
-
 
 ```
