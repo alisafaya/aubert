@@ -9,11 +9,12 @@ import argparse
 import sys
 import itertools
 import random
+import ipdb
+from multiprocessing import Pool
 
 from tqdm import tqdm
 
 from nltk.util import ngrams
-from transformers import BertTokenizerFast, Wav2Vec2Processor
 
 import soundfile as sf
 import numpy as np
@@ -32,6 +33,8 @@ logger.addHandler(handler)
 tokenizer = ""
 processor = ""
 
+torch.multiprocessing.set_sharing_strategy('file_system')
+
 def get_speaker_dict(books, min_utterances=100):
 
     speakers = {}
@@ -39,7 +42,7 @@ def get_speaker_dict(books, min_utterances=100):
     for book in books:
         raw_books[book['book_name']] = book['raw']
         for utterance in book['utterances']:
-            if utterance['similarity'] == 0:
+            if utterance['similarity'] == 0 or 'words' not in utterance:
                 continue
 
             if utterance['speaker_id'] not in speakers:
@@ -66,6 +69,7 @@ def prepare_text_input(texts, args):
     global tokenizer
     if not tokenizer:
         logger.info("Loading tokenizer: %s" % args.tokenizer)
+        from transformers import BertTokenizerFast
         tokenizer = BertTokenizerFast.from_pretrained(args.tokenizer)
 
     mask_ratio = args.mask_ratio
@@ -74,7 +78,7 @@ def prepare_text_input(texts, args):
 
         pre_tokenized = tokenizer.backend_tokenizer.pre_tokenizer.pre_tokenize_str(text)
     
-        char_offset_map = np.zeros(len(text), dtype=np.int32)
+        char_offset_map = np.zeros(len(text), dtype=np.int16)
         for i, (_, x) in enumerate(pre_tokenized):
             char_offset_map[x[0]:x[1]] = i + 1
 
@@ -82,7 +86,7 @@ def prepare_text_input(texts, args):
         char_offset_map -= 1
 
         masked_span_start = char_offset_map[span_start]
-        masked_span_end = char_offset_map[span_end] + 1
+        masked_span_end = char_offset_map[span_end]
 
         words = [ x[0] for x in pre_tokenized ]
 
@@ -95,7 +99,7 @@ def prepare_text_input(texts, args):
 
         tokens_to_mask = list(itertools.chain(*[ range(*s) for s in offset_map[mask_indices] ]))
 
-        return words, tokens_to_mask, (offset_map[masked_span_start], offset_map[masked_span_end])
+        return words, tokens_to_mask, (int(offset_map[masked_span_start][0] + 1), int(offset_map[masked_span_end][1] + 1)) # +1 to account for [CLS]
 
     words, tokens_to_mask, span_positions = list(zip(*[ mask(*x) for x in texts ]))
 
@@ -103,9 +107,16 @@ def prepare_text_input(texts, args):
                         truncation=True, padding=True)
 
     encoded['labels'] = encoded['input_ids'].clone()
-    for batch, mask in enumerate(tokens_to_mask):
-        mask_indices = np.array(mask) + 1
+    for batch, m in enumerate(tokens_to_mask):
+        mask_indices = np.array(m) + 1
         encoded['input_ids'][batch][mask_indices[mask_indices < (args.max_seq_length - 2) ]] = tokenizer.mask_token_id # +1 to account for [CLS]
+
+    for k in list(encoded.keys()):
+        if k in ("input_ids", "labels"):
+            encoded[k] = encoded[k].to(torch.int16)
+
+        elif k in ("attention_mask", "token_type_ids"):
+            encoded[k] = encoded[k].to(torch.bool)
 
     return encoded, span_positions
 
@@ -115,6 +126,7 @@ def prepare_audio_input(audios, args):
     global processor
     if not processor:
         logger.info("Loading audio processor: %s" % args.audio_processor)
+        from transformers import Wav2Vec2Processor
         processor = Wav2Vec2Processor.from_pretrained(args.audio_processor)
 
     encoded = processor(audios, return_tensors="pt", sampling_rate=16000, padding='longest')
@@ -129,12 +141,38 @@ def prepare_speaker_ngram_data(instances, args):
     text_encoded, span_indices = prepare_text_input(contexts, args)
     audio_encoded = prepare_audio_input(audios, args)
 
-    return { 'text': text_encoded, 'audio': audio_encoded, 'ngrams': ngrams, 'spans': span_indices }
+    return { 'text': text_encoded, 'audio': audio_encoded, 'ngrams': ngrams[0], 'spans': span_indices }
 
 
-def collate_speaker_data(speaker_data, raw_books, args):
+def collate_single_ngram(tup, speaker_data, raw_books, args):
+    ngram, indices = tup
 
-    audio_data, speaker_vocab_map = {}, {}
+    if len(indices) > args.max_samples_per_ngram:
+        random.shuffle(indices)
+        indices = indices[:args.max_samples_per_ngram]
+
+    instances = []
+    for i, j, ngram_size in indices:
+        alignments = speaker_data[i]['words']
+        audio_data = sf.read(os.path.join(args.audio_dir, speaker_data[i]['fname'].split("/")[-1]))[0]
+        _, start_idx, _, audio_starts, _ = alignments[j]
+        _, _, end_idx, _, audio_ends = alignments[j + ngram_size - 1]
+
+        relative_start_idx = start_idx - max(0, start_idx - 512)
+        relative_end_idx = end_idx - max(0, start_idx - 512)
+
+        context_window = (raw_books[speaker_data[i]['book']][max(0, start_idx - 512):end_idx + 512], relative_start_idx, relative_end_idx)
+        audio_segment = audio_data[audio_starts * 16:audio_ends * 16] # assume 16kHz sampling rate
+
+        instances.append((ngram, context_window, audio_segment))
+
+    return prepare_speaker_ngram_data(instances, args)
+
+from functools import partial
+
+def collate_speaker_data(speaker_data, raw_books, args, pool):
+
+    speaker_vocab_map = {}
     for i, utterance in enumerate(speaker_data):
         if utterance.get('words', False):
             for ngram_size in range(args.max_ngram_size):
@@ -146,32 +184,20 @@ def collate_speaker_data(speaker_data, raw_books, args):
                     speaker_vocab_map[ngram].append((i, j, ngram_size))
 
     speaker_vocab_map = { k: v for k, v in speaker_vocab_map.items() if len(v) >= args.min_ngram_occurrences }
+    speaker_vocab_map = list(speaker_vocab_map.items())
+    random.shuffle(speaker_vocab_map)
 
     data_instances = []
-    for ngram, indices in speaker_vocab_map.items():
-        if len(indices) > args.max_samples_per_ngram:
-            random.shuffle(indices)
-            indices = indices[:args.max_samples_per_ngram]
 
-        instances = []
-        for i, j, ngram_size in indices:
-            alignments = speaker_data[i]['words']
-            audio_data = sf.read(os.path.join(args.audio_dir, speaker_data[i]['fname'].split("/")[-1]))[0]
-            _, start_idx, _, audio_starts, _ = alignments[j]
-            _, _, end_idx, _, audio_ends = alignments[j + ngram_size - 1]
-
-            relative_start_idx = start_idx - max(0, start_idx - 512)
-            relative_end_idx = end_idx - max(0, start_idx - 512)
-
-            context_window = (raw_books[speaker_data[i]['book']][max(0, start_idx - 512):end_idx + 512], relative_start_idx, relative_end_idx)
-            audio_segment = audio_data[audio_starts * 16:audio_ends * 16] # assume 16kHz sampling rate
-
-            instances.append((ngram, context_window, audio_segment))
-
-        data_instances.append(prepare_speaker_ngram_data(instances, args))
-        if len(data_instances) > args.chunk_size:
+    for ngram_data in tqdm(pool.imap_unordered(partial(collate_single_ngram, speaker_data=speaker_data, raw_books=raw_books, args=args), speaker_vocab_map), 
+                            total=len(speaker_vocab_map)):
+        data_instances.append(ngram_data)
+        if len(data_instances) == args.chunk_size:
             yield data_instances
             data_instances = []
+
+    if len(data_instances) > 0:
+        yield data_instances
 
     return data_instances
 
@@ -196,6 +222,7 @@ if __name__ == '__main__':
     argparser.add_argument('--min-utter-per-speaker', type=int, default=100, help='The minimum number of utterances per speaker to include in the dataset')
     argparser.add_argument('--min-ngram-occurrences', type=int, default=10, help='The minimum number of times a n-gram must occur in the dataset to be included')
     argparser.add_argument('--max-samples-per-ngram', type=int, default=128, help='The maximum number of samples per n-gram to include in the dataset')
+    argparser.add_argument('--num-workers', type=int, default=8, help='The number of workers to use for data loading')
     argparser.add_argument('--output-dir', type=str, help='Directory to save the output')
     argparser.add_argument('--tokenizer', type=str, default="bert-base-uncased", help='The tokenizer to use for tokenization')
     args = argparser.parse_args()
@@ -212,7 +239,11 @@ if __name__ == '__main__':
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
 
-    for speaker in speakers:
-        speaker_data = collate_speaker_data(speakers[speaker], raw_books, args)
-        for i, chunk in tqdm(enumerate(speaker_data)):
-            torch.save(chunk, os.path.join(args.output_dir, speaker + f".{i}.pt"))
+    # Create the pool of workers
+    with Pool(args.num_workers) as pool:
+        for speaker in speakers:
+            speaker_data = collate_speaker_data(speakers[speaker], raw_books, args, pool)
+            for i, chunk in enumerate(speaker_data):
+                torch.save(chunk, os.path.join(args.output_dir, speaker + f".{i}.pt"))
+                logging.info("Saved chunk %d for speaker %s" % (i, speaker))
+
