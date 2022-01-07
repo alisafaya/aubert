@@ -90,6 +90,7 @@ python aubert/prepare_data.py --alignments data/aligned/ --output-dir bin/out-da
 Arguments:
 
 ```
+optional arguments:
   --alignments ALIGNMENTS
                         Directory to The JSON files for word-level aligned book data as prepared in the preprocessing step
   --audio-dir AUDIO_DIR
@@ -108,12 +109,22 @@ Arguments:
                         The minimum number of utterances per speaker to include in the dataset
   --min-ngram-occurrences MIN_NGRAM_OCCURRENCES
                         The minimum number of times a n-gram must occur in the dataset to be included
+  --min-audio-length MIN_AUDIO_LENGTH
+                        The minimum length of audio segments to include in the dataset
   --max-samples-per-ngram MAX_SAMPLES_PER_NGRAM
                         The maximum number of samples per n-gram to include in the dataset
+  --max-ngrams-per-speaker MAX_NGRAMS_PER_SPEAKER
+                        The maximum number of samples per n-gram to include in the dataset
+  --num-workers NUM_WORKERS
+                        The number of workers to use for data loading
   --output-dir OUTPUT_DIR
                         Directory to save the output
   --tokenizer TOKENIZER
                         The tokenizer to use for tokenization
+  --rank RANK           Rank of the current process
+  --world_size WORLD_SIZE
+                        World size: total nodes
+
 ```
 
 

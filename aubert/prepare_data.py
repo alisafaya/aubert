@@ -9,9 +9,7 @@ import argparse
 import sys
 import itertools
 import random
-import ipdb
-from multiprocessing import Pool
-
+from multiprocessing import Pool, Manager, Lock
 from tqdm import tqdm
 
 from nltk.util import ngrams
@@ -31,10 +29,8 @@ handler.setFormatter(formatter)
 
 logger.addHandler(handler)
 
-tokenizer = ""
-processor = ""
-
-torch.multiprocessing.set_sharing_strategy('file_system')
+tokenizer = {}
+processor = {}
 
 def get_speaker_dict(books, min_utterances=100):
 
@@ -100,24 +96,24 @@ def prepare_text_input(texts, args):
 
         tokens_to_mask = list(itertools.chain(*[ range(*s) for s in offset_map[mask_indices] ]))
 
-        return words, tokens_to_mask, (int(offset_map[masked_span_start][0] + 1), int(offset_map[masked_span_end][1] + 1)) # +1 to account for [CLS]
+        return words, tokens_to_mask, (int(offset_map[masked_span_start][0] + 1), int(offset_map[masked_span_end][0] + 1)) # +1 to account for [CLS]
 
     words, tokens_to_mask, span_positions = list(zip(*[ mask(*x) for x in texts ]))
 
-    encoded = tokenizer(list(words), is_split_into_words=True, add_special_tokens=True, return_tensors="pt", max_length=args.max_seq_length,
+    encoded = tokenizer(list(words), is_split_into_words=True, add_special_tokens=True, return_tensors="np", max_length=args.max_seq_length,
                         truncation=True, padding=True)
 
-    encoded['labels'] = encoded['input_ids'].clone()
+    encoded['labels'] = encoded['input_ids'].copy()
     for batch, m in enumerate(tokens_to_mask):
         mask_indices = np.array(m) + 1
         encoded['input_ids'][batch][mask_indices[mask_indices < (args.max_seq_length - 2) ]] = tokenizer.mask_token_id # +1 to account for [CLS]
 
     for k in list(encoded.keys()):
         if k in ("input_ids", "labels"):
-            encoded[k] = encoded[k].to(torch.int16)
+            encoded[k] = encoded[k].astype(np.int16)
 
         elif k in ("attention_mask", "token_type_ids"):
-            encoded[k] = encoded[k].to(torch.bool)
+            encoded[k] = encoded[k].astype(np.bool8)
 
     return encoded, span_positions
 
@@ -130,7 +126,9 @@ def prepare_audio_input(audios, args):
         from transformers import Wav2Vec2Processor
         processor = Wav2Vec2Processor.from_pretrained(args.audio_processor)
 
-    encoded = processor(audios, return_tensors="pt", sampling_rate=16000, padding='longest')
+    encoded = processor(audios, return_tensors="np", sampling_rate=16000, padding='longest')
+    encoded['attention_mask'] = encoded["attention_mask"].astype(np.bool8)
+
     return encoded
 
 
@@ -143,7 +141,21 @@ def prepare_speaker_ngram_data(instances, args):
     return { 'text': text_encoded, 'audio': audio_encoded, 'ngrams': ngrams[0], 'spans': span_indices }
 
 
-def collate_single_ngram(tup, speaker_data, raw_books, args):
+def get_audio(cache_dict, cache_queue, audio_fname):
+    if audio_fname in cache_dict:
+        return cache_dict[audio_fname]
+
+    if len(cache_queue) > 4096:
+        cache_dict.pop(cache_queue.pop(0))
+
+    content = sf.read(audio_fname)[0]
+    cache_dict[audio_fname] = content
+    cache_queue.append(audio_fname)
+
+    return content
+
+
+def collate_single_ngram(tup, speaker_data, raw_books, args, cache_dict, cache_queue):
     ngram, indices = tup
 
     if len(indices) > args.max_samples_per_ngram:
@@ -159,7 +171,7 @@ def collate_single_ngram(tup, speaker_data, raw_books, args):
         if (audio_ends - audio_starts) < args.min_audio_length:
             continue
 
-        audio_data = sf.read(os.path.join(args.audio_dir, speaker_data[i]['fname'].split("/")[-1]))[0]
+        audio_data = get_audio(cache_dict, cache_queue, speaker_data[i]['fname'].split("/")[-1])
         relative_start_idx = start_idx - max(0, start_idx - 512)
         relative_end_idx = end_idx - max(0, start_idx - 512)
 
@@ -177,7 +189,7 @@ def collate_single_ngram(tup, speaker_data, raw_books, args):
     else:
         return []
 
-def collate_speaker_data(speaker_data, raw_books, args, pool):
+def collate_speaker_data(speaker_data, raw_books, args, pool, speaker_id, cache_dict, cache_queue):
 
     speaker_vocab_map = {}
     for i, utterance in enumerate(speaker_data):
@@ -194,9 +206,14 @@ def collate_speaker_data(speaker_data, raw_books, args, pool):
     speaker_vocab_map = list(speaker_vocab_map.items())
     random.shuffle(speaker_vocab_map)
 
-    data_instances = []
+    logger.info("Found %d vocabulary for speaker %s" % (len(speaker_vocab_map), speaker_id))
 
-    for ngram_data in tqdm(pool.imap_unordered(partial(collate_single_ngram, speaker_data=speaker_data, raw_books=raw_books, args=args), speaker_vocab_map), 
+    if len(speaker_vocab_map) > args.max_ngrams_per_speaker:
+        speaker_vocab_map = speaker_vocab_map[:args.max_ngrams_per_speaker]
+
+    data_instances = []
+    logger.info("Processing speaker's data...")
+    for ngram_data in tqdm(pool.imap_unordered(partial(collate_single_ngram, speaker_data=speaker_data, raw_books=raw_books, args=args, cache_dict=cache_dict, cache_queue=cache_queue), speaker_vocab_map), 
                             total=len(speaker_vocab_map)):
         if ngram_data:
             data_instances.append(ngram_data)
@@ -232,9 +249,13 @@ if __name__ == '__main__':
     argparser.add_argument('--min-ngram-occurrences', type=int, default=10, help='The minimum number of times a n-gram must occur in the dataset to be included')
     argparser.add_argument('--min-audio-length', type=int, default=400, help='The minimum length of audio segments to include in the dataset')
     argparser.add_argument('--max-samples-per-ngram', type=int, default=128, help='The maximum number of samples per n-gram to include in the dataset')
+    argparser.add_argument('--max-ngrams-per-speaker', type=int, default=64, help='The maximum number of samples per n-gram to include in the dataset')
     argparser.add_argument('--num-workers', type=int, default=8, help='The number of workers to use for data loading')
     argparser.add_argument('--output-dir', type=str, help='Directory to save the output')
     argparser.add_argument('--tokenizer', type=str, default="bert-base-uncased", help='The tokenizer to use for tokenization')
+    argparser.add_argument('--rank', type=int, default=0, help='Rank of the current process')
+    argparser.add_argument('--world_size', type=int, default=1, help='World size: total nodes')
+
     args = argparser.parse_args()
 
     logger.info("Loading alignments...")
@@ -246,14 +267,25 @@ if __name__ == '__main__':
     logger.info("Found %d speakers, %d were deleted due to having less than %d utterances" % (len(speakers), len(deleted_speakers), args.min_utter_per_speaker))
     logger.info("Total ignored utterances: %d" % sum([utterance_count for _, utterance_count in deleted_speakers]))
 
+    speakers = list(speakers.items())
+    speakers = sorted(speakers, key=lambda x: x[0])
+    random.shuffle(speakers)
+
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
+
+    num_speakers = len(speakers)
+    speakers_per_node = (len(speakers)  + 1) // args.world_size
+    speakers = speakers[args.rank * speakers_per_node: (args.rank + 1) *  speakers_per_node]
+
+    logger.info("Processing speakers: [ %s ]" % (",".join([x[0] for x in speakers ])))
 
     # Create the pool of workers
     with Pool(args.num_workers) as pool:
         total_vocab, total_samples = 0, 0
-        for speaker in speakers:
-            speaker_data = collate_speaker_data(speakers[speaker], raw_books, args, pool)
+        for speaker, data in speakers:
+            audio_dict, audio_cache = {}, []
+            speaker_data = collate_speaker_data(data, raw_books, args, pool, speaker, audio_dict, audio_cache)
             for i, chunk in enumerate(speaker_data):
                 torch.save(chunk, os.path.join(args.output_dir, speaker + f".{i}.pt"))
                 logger.info("Saved chunk %d for speaker %s" % (i, speaker))
