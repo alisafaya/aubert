@@ -58,19 +58,24 @@ class ProjectionHead(nn.Module):
         embedding_dim,
         projection_dim,
         dropout,
-        activation="gelu"
+        activation="gelu",
+        linear=True
     ):
         super(ProjectionHead, self).__init__()
         self.projection = nn.Linear(embedding_dim, projection_dim)
 
-        self.activation = transformers.activations.ACT2FN[activation]            
+        if not linear:
+	        self.activation = transformers.activations.ACT2FN[activation]            
 
-        self.fc = nn.Linear(projection_dim, projection_dim)
-        self.dropout = nn.Dropout(dropout)
-        self.layer_norm = nn.LayerNorm(projection_dim)
+	        self.fc = nn.Linear(projection_dim, projection_dim)
+	        self.dropout = nn.Dropout(dropout)
+	        self.layer_norm = nn.LayerNorm(projection_dim)
     
     def forward(self, x):
         projected = self.projection(x)
+        if linear:
+        	return projected
+        	
         x = self.activation(projected)
         x = self.fc(x)
         x = self.dropout(x)
