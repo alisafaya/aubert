@@ -4,11 +4,11 @@ import json
 import tokenizers
 import argparse
 from argparse import ArgumentParser
-import argparse
 import os
 from tqdm import tqdm
 import numpy as np
-
+import multiprocessing
+from functools import partial
 
 whitesplit = tokenizers.pre_tokenizers.WhitespaceSplit()
 
@@ -81,35 +81,24 @@ def refine_alignment(utterance, reference, start_idx, end_idx, var_ratio=0.4, ve
 
 
 
-def main():
-    parser = argparse.ArgumentParser(description='Refine sliding window alignments, by looking for a local maximum around the span that maximizes the Levenshtein distance between the ASR output and the span from the original book.')
-    parser.add_argument('--source_dir', default="alignments/", type=str, help='Source directory, where the alignments to be refined are located, default: alignments/')
-    parser.add_argument('--output_dir', default="alignments/", type=str, help='Output directory where refined outputs will be written to, default: alignments/')
-    parser.add_argument('--max_length', default=5000, type=int, help="Maximum number of characters in a window to avoid processing huge chunks, default: 5000")
-    parser.add_argument('--retain_all_data', action="store_true", help="Retain the old data in the input. If not selected, parts of the original data such as the old spans will be overwritten with the improved spans.")
-    parser.add_argument('--ratio', default=0.4, type=float, help="Range to look in within neighborhood. For a given ratio r, spans within the range start_idx-(r*N):end_idx+(r*N) will be examined, where N is the length of the span.") 
-    parser.add_argument('--num_chunks', default=1, type=int, help="Number of chunks to use.")
-    parser.add_argument('--chunk_id', default=0, type=int, help="ID of current chunk.")
-
-    args = parser.parse_args()
-
+def refine_alignments(args, num_chunks, chunk_id):
     original_alignments_dir = args.source_dir
     output_dir = args.output_dir
     max_length = args.max_length
     retain_data = args.retain_all_data
     max_ratio = args.ratio
-    num_chunks = args.num_chunks
-    chunk_id = args.chunk_id
+
+    os.makedirs(output_dir, exist_ok=True)
 
     print(f"Chunk id: {chunk_id}, Num Chunks: {num_chunks}")
 
-    for annotation_name in tqdm(np.array_split(os.listdir(original_alignments_dir), num_chunks)[chunk_id]):
+    for annotation_name in tqdm(np.array_split(os.listdir(original_alignments_dir), num_chunks)[chunk_id], disable=num_chunks!=1):
         dct = json.load(open(os.path.join(original_alignments_dir, annotation_name)))
         
         # Some indices have 
         bad_indices = set()
 
-        for annotation_idx in tqdm(range(len(dct["utterances"])), leave=False):
+        for annotation_idx in tqdm(range(len(dct["utterances"])), leave=False, disable=num_chunks!=1):
             utterance_dct = dct["utterances"][annotation_idx]
             utterance = utterance_dct["utterance"]
             
@@ -141,4 +130,23 @@ def main():
         json.dump(dct, open(os.path.join(output_dir, annotation_name), "w"), indent=2)
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description='Refine sliding window alignments, by looking for a local maximum around the span that maximizes the Levenshtein distance between the ASR output and the span from the original book.')
+    parser.add_argument('-i', '--source_dir', default="alignments/", type=str, help='Source directory, where the alignments to be refined are located, default: alignments/')
+    parser.add_argument('-o', '--output_dir', default="alignments/", type=str, help='Output directory where refined outputs will be written to, default: alignments/')
+    parser.add_argument('--max_length', default=5000, type=int, help="Maximum number of characters in a window to avoid processing huge chunks, default: 5000")
+    parser.add_argument('--retain_all_data', action="store_true", help="Retain the old data in the input. If not selected, parts of the original data such as the old spans will be overwritten with the improved spans.")
+    parser.add_argument('--ratio', default=0.4, type=float, help="Range to look in within neighborhood. For a given ratio r, spans within the range start_idx-(r*N):end_idx+(r*N) will be examined, where N is the length of the span.") 
+    parser.add_argument('--num_chunks', default=1, type=int, help="Number of chunks to use.")
+    parser.add_argument('--chunk_id', default=0, type=int, help="ID of current chunk.")
+
+    args = parser.parse_args()
+
+    num_chunks = args.num_chunks
+    chunk_id = args.chunk_id
+
+    # Start the alignment process
+    refine_alignment_partial = partial(refine_alignments, args, num_chunks)
+
+    with multiprocessing.Pool(num_chunks) as pool:
+        for job in tqdm(pool.imap_unordered(refine_alignment_partial, range(num_chunks)), total=num_chunks, disable=num_chunks==1):
+            pass

@@ -12,7 +12,7 @@ from sacremoses import MosesPunctNormalizer
 import string
 
 
-def main(args, num_chunks, chunk_id):
+def perform_forced_alignment(args, num_chunks, chunk_id):
     input_dir = args.input_dir
     work_dir = args.work_dir
     num_jobs = args.num_jobs
@@ -59,11 +59,11 @@ if __name__ == "__main__":
     parser.add_argument('--work_dir', default="data/forced_alignments", type=str, help='Output directory where forced word alignments will be written to, default: data/forced_alignments')
     parser.add_argument('--num_chunks', default=1, type=int, help="Number of chunks to use.")
     parser.add_argument('--chunk_id', default=0, type=int, help="ID of current chunk.")
-    parser.add_argument('--num_jobs', default=5, type=int, help="Number of chunks to use.")
+    parser.add_argument('--num_jobs', default=5, type=int, help="Number of jobs to use for MFA.")
     parser.add_argument('--max_retries', default=2, type=int, help="Maximum number of retries. Default: 2")
 
     args = parser.parse_args()
     num_chunks = args.num_chunks
     chunk_id = args.chunk_id
 
-    main(args, num_chunks, chunk_id)
+    perform_forced_alignment(args, num_chunks, chunk_id)
