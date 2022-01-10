@@ -52,6 +52,15 @@ class AuBERT(nn.Module):
         
         return loss
 
+    def _get_grad_norm(self):
+        total_norm = 0
+        for p in self.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        total_norm = total_norm ** (1. / 2)
+        return total_norm 
+
 class ProjectionHead(nn.Module):
     def __init__(
         self,
@@ -59,10 +68,11 @@ class ProjectionHead(nn.Module):
         projection_dim,
         dropout,
         activation="gelu",
-        linear=True
+        linear=False
     ):
         super(ProjectionHead, self).__init__()
         self.projection = nn.Linear(embedding_dim, projection_dim)
+        self.linear = linear
 
         if not linear:
 	        self.activation = transformers.activations.ACT2FN[activation]            
@@ -73,9 +83,9 @@ class ProjectionHead(nn.Module):
     
     def forward(self, x):
         projected = self.projection(x)
-        if linear:
+        if self.linear:
         	return projected
-        	
+
         x = self.activation(projected)
         x = self.fc(x)
         x = self.dropout(x)
@@ -105,15 +115,12 @@ class TextEncoder(nn.Module):
         
     def forward(self, spans=None, *args, **kwargs):
         last_hiddens = self.model(*args,output_hidden_states=True, **kwargs).hidden_states[-1]
+
         if spans is None:
             return last_hiddens
         else:
             device = kwargs["input_ids"].device
-            
-            spans = torch.vstack([torch.arange(b, e, device=device) for b, e in spans])
-            span_representations = last_hiddens[torch.arange(len(spans), device=device).unsqueeze(1), spans]
-            
-            pooled_output = self.pool(span_representations)
+            pooled_output = torch.cat([ self.pool(last_hiddens[i:i+1, b:e]) for i, (b, e) in enumerate(spans) ])
             return pooled_output
 
 class AudioEncoder(nn.Module):
@@ -141,7 +148,6 @@ class AudioEncoder(nn.Module):
         outputs = self.model(*args, **kwargs).last_hidden_state
         
         pooled_output = self.pool(outputs)
-        
         return pooled_output
         
 class Pooler(nn.Module):
