@@ -128,15 +128,14 @@ class TextEncoder(nn.Module):
         model_output = self.model(*args,output_hidden_states=True, **kwargs)
         last_hiddens = model_output.hidden_states[-1]
         loss = model_output.loss
+        
         if spans is None:
             return last_hiddens, loss
         else:
             device = kwargs["input_ids"].device
             
-            spans = torch.vstack([torch.arange(b, e, device=device) for b, e in spans])
-            span_representations = last_hiddens[torch.arange(len(spans), device=device).unsqueeze(1), spans]
-            
-            pooled_output = self.pool(span_representations)
+            pooled_output = torch.cat([ self.pool(last_hiddens[i:i+1, b:e]) for i, (b, e) in enumerate(spans) ])
+
             return pooled_output, loss
 
 
