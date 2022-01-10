@@ -246,7 +246,7 @@ class MfaAligner():
 		os.makedirs(outputdir, exist_ok=True)
 		os.makedirs(tmpdir, exist_ok=True)
 
-		if not skipcopying:
+		if not skipprep:
 			for idx, (text, audiopath) in tqdm(enumerate(zip(texts, audiopaths)), desc="Preparing data"):
 				if prefixes is not None:
 					fileprefix = prefixes[idx]

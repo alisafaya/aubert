@@ -73,6 +73,13 @@ python scripts/match_utterances_to_books.py -u bin/medium_transcriptions.tsv -p 
 python scripts/refine_alignments.py -i alignments/ -o alignments/
 ```
 
+- Download forced alignment models for English:
+
+```
+mfa model download acoustic english
+mfa model download dictionary english
+```
+
 - Apply alignment for on word level:
 
 ```

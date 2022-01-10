@@ -21,10 +21,11 @@ def get_speakerid(txt):
 def get_audio_name(txt):
     return Path(txt).stem
 
-def main(args, num_chunks, chunk_id):
+def merge_word_alignments(args, num_chunks, chunk_id):
     inpdir = args.input_dir
     workdir = args.work_dir
     outdir = args.output_dir
+    verbose = args.verbose
 
     print(f"Chunk id: {chunk_id}, Num Chunks: {num_chunks}")
 
@@ -34,9 +35,9 @@ def main(args, num_chunks, chunk_id):
 
     has_problem=0
 
-    for jsfl in tqdm(np.array_split(os.listdir(inpdir), num_chunks)[chunk_id]):
+    for jsfl in tqdm(np.array_split(os.listdir(inpdir), num_chunks)[chunk_id], disable=not verbose):
         j = json.load(open(os.path.join(inpdir, jsfl)))
-        for utt in tqdm(j["utterances"], leave=False):
+        for utt in tqdm(j["utterances"], leave=False, disable=not verbose):
             if not get_audio_name(utt["fname"])in annotation_dict:
                 continue
             
@@ -73,18 +74,19 @@ def main(args, num_chunks, chunk_id):
     print(has_problem)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Refine sliding window alignments, by looking for a local maximum around the span that maximizes the Levenshtein distance between the ASR output and the span from the original book.')
-    parser.add_argument('--input_dir', default="ali_annotations", type=str, help='Output directory where refined outputs will be written to, default: ali_annotations')
-    parser.add_argument('--work_dir', default="data/forced_alignments", type=str, help='Output directory where forced word alignments will be written to, default: data/forced_alignments')    
-    parser.add_argument('--output_dir', default="data/aligned", type=str, help='Output directory where refined outputs will be written to, default: data/aligned')
+    parser = argparse.ArgumentParser(description='Merge word alignments from MFA to the original annotations.')
+    parser.add_argument('--input_dir', default="alignments", type=str, help='Output directory where refined outputs will be written to, default: alignments')
+    parser.add_argument('--work_dir', default="data/forced_alignments", type=str, help='Output directory where forced word alignments will be written to, default: data/forced_alignments')
+    parser.add_argument('--output_dir', default="data/aligned", type=str, help='Output directory where refined outputs will be written to, default: data/aligned')  
     parser.add_argument('--num_chunks', default=1, type=int, help="Number of chunks to use. Default: 1 (no chunking)")
     parser.add_argument('--chunk_id', default=0, type=int, help="ID of current chunk, if chunking is used. Default: 0 (in case of no chunking)")
+    parser.add_argument('--verbose', action="store_true", help="Enable logging")
 
     args = parser.parse_args()
 
     num_chunks = args.num_chunks
     chunk_id = args.chunk_id
 
-    main(args, num_chunks, chunk_id)
+    merge_word_alignments(args, num_chunks, chunk_id)
 
 
