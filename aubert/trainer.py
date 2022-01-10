@@ -88,20 +88,27 @@ def evaluate(model, batch_path, device, args, global_step, writer=None):
     with torch.no_grad():
         eval_data = torch.load(batch_path)
         total_samples, total_loss = 0, 0
+        text_loss, cont_loss = 0, 0
         for batch in eval_data:
             batch_inputs = get_batch(batch, args.batch_size, sample=False, device=device)
 
             # calculate loss
             with torch.cuda.amp.autocast(enabled=args.no_amp):
-                loss = model(batch_inputs['text'], batch_inputs['audio'], batch_inputs['spans'])
+                outputs = model(batch_inputs['text'], batch_inputs['audio'], batch_inputs['spans'])
 
-            total_loss += loss.item()
+            total_loss += outputs['loss'].item()
+            cont_loss += outputs['loss_contrastive'].item()
+            text_loss += outputs['loss_text'].item()
             total_samples += 1
 
     total_loss /= total_samples
+    cont_loss /= total_samples
+    text_loss /= total_samples
 
     if writer is not None:
-        writer.add_scalar(f'{batch_path}/loss', loss, global_step)
+        writer.add_scalar(f'{batch_path.replace("/", "-")}/loss', total_loss, global_step)
+        writer.add_scalar(f'{batch_path.replace("/", "-")}/text-loss', cont_loss, global_step)
+        writer.add_scalar(f'{batch_path.replace("/", "-")}/cont-loss', text_loss, global_step)
 
     logger.info("Finished evaluation")
     logger.info(f'| step {global_step:0>6} | loss {total_loss:5.2f} |')
@@ -125,6 +132,7 @@ def train(model, batch_path, optimizer, scaler, args, global_step=0, writer=None
     model.train()
     losses, grad_history = [], []
     total_loss, minibatch = 0, 0
+    text_loss, cont_loss = 0, 0
     with model.join(), torch.profiler.profile(
         schedule=torch.profiler.schedule(wait=2, warmup=4, active=4, repeat=2),
         on_trace_ready=torch.profiler.tensorboard_trace_handler('bin/log/profile'),
@@ -140,7 +148,9 @@ def train(model, batch_path, optimizer, scaler, args, global_step=0, writer=None
 
             # calculate loss
             with torch.cuda.amp.autocast(enabled=args.no_amp):
-                loss = model(batch_inputs['text'], batch_inputs['audio'], batch_inputs['spans'])
+                outputs = model(batch_inputs['text'], batch_inputs['audio'], batch_inputs['spans'])
+
+            loss = outputs['loss']
 
             # do backward pass
             scaler.scale(loss).backward()
@@ -175,16 +185,23 @@ def train(model, batch_path, optimizer, scaler, args, global_step=0, writer=None
             prof.step()
 
             total_loss += loss.item()
+            cont_loss += outputs['loss_contrastive'].item()
+            text_loss += outputs['loss_text'].item()
+
             minibatch += 1
             global_step += 1
 
             if minibatch % log_interval == 0:
                 total_loss = min(total_loss / log_interval, 1e1) # max loss value logged is 10 to prevent logging big values.
+                cont_loss = min(cont_loss / log_interval, 1e1) # max loss value logged is 10 to prevent logging big values.
+                text_loss = min(text_loss / log_interval, 1e1) # max loss value logged is 10 to prevent logging big values.
                 grad_norm /= log_interval
                 lr = optimizer.param_groups[0]['lr']
 
                 if writer is not None and rank == 0:
                     writer.add_scalar('training/loss', total_loss, global_step)
+                    writer.add_scalar('training/text-loss', cont_loss, global_step)
+                    writer.add_scalar('training/cont-loss', text_loss, global_step)
                     writer.add_scalar('training/gnorm', grad_norm, global_step)
                     writer.add_scalar('training/scale', scaler.get_scale(), global_step)
                     writer.add_scalar('training/lr', lr, global_step)
