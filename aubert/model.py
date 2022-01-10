@@ -51,13 +51,21 @@ class AuBERT(nn.Module):
 
         loss_t = F.cross_entropy(logits_per_text, labels)
         loss_a = F.cross_entropy(logits_per_audio, labels)
-        
+
         loss = (loss_a + loss_t) / 2
+
+        # Given the text, the accuracy of predicting the corresponding audio
+        a_acc = (torch.argmax(logits_per_text, dim=-1).detach().cpu() == torch.arange(batch_size)).float().sum()
+
+        # Given the audio, the accuracy of predicting the corresponding text
+        t_acc = (torch.argmax(logits_per_audio, dim=-1).detach().cpu() == torch.arange(batch_size)).float().sum()
 
         result_dict = {}
         result_dict["loss_contrastive"] = loss
         result_dict["loss_text"] = text_loss
         result_dict["loss"] = text_loss + loss
+        result_dict["audio_acc"] = a_acc
+        result_dict["text_acc"] = t_acc
 
         return result_dict
 
@@ -126,16 +134,13 @@ class TextEncoder(nn.Module):
         
     def forward(self, spans=None, *args, **kwargs):
         model_output = self.model(*args,output_hidden_states=True, **kwargs)
-        last_hiddens = model_output.hidden_states[-1]
+        last_hiddens = model_output.hidden_states[-1] # output of the final layer of the text encoder model.
         loss = model_output.loss
-        
+
         if spans is None:
             return last_hiddens, loss
         else:
-            device = kwargs["input_ids"].device
-            
             pooled_output = torch.cat([ self.pool(last_hiddens[i:i+1, b:e]) for i, (b, e) in enumerate(spans) ])
-
             return pooled_output, loss
 
 
@@ -162,7 +167,6 @@ class AudioEncoder(nn.Module):
     
     def forward(self, *args, **kwargs):
         outputs = self.model(*args, **kwargs).last_hidden_state
-        
         pooled_output = self.pool(outputs)
         return pooled_output
 
@@ -186,12 +190,14 @@ class Pooler(nn.Module):
         else:
             raise ValueError(f"mode argument {mode} unknown. Possible values: mean, max, all")
         
-        self.out = nn.Linear(self.hidden_size*len(self.pool_functions) , self.hidden_size)
+        self.out = nn.Linear(self.hidden_size * len(self.pool_functions) , self.hidden_size)
 
     def forward(self, x): 
         # x -> B, T, H
-        conc = torch.cat([f(x) for f in self.pool_functions], 1) # -> B, len(self.pool_functions)*H
+        assert x.ndim == 3
+        conc = torch.cat([ f(x) for f in self.pool_functions], dim=-1) # -> B, len(self.pool_functions)*H
         conc = self.out(conc)  # -> B, H
+
         return conc
     
     def _maxpool(x):
@@ -201,6 +207,7 @@ class Pooler(nn.Module):
     def _avgpool(x):
         x = torch.mean(x, 1)
         return x
+
 
 class LSTMPooler(nn.Module):
     def __init__(

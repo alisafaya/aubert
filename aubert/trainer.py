@@ -14,16 +14,22 @@ import torch.nn as nn
 from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
 from tensorboardX import SummaryWriter
 
+import time
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
+formatter = logging.Formatter('%(asctime)s - %(message)s')
+
 handler = logging.StreamHandler(sys.stdout)
 handler.setLevel(logging.DEBUG)
-formatter = logging.Formatter('%(asctime)s - %(message)s')
 handler.setFormatter(formatter)
-
 logger.addHandler(handler)
 
+fh = logging.FileHandler(f'bin/logs/trainer_{time.time()}.log')
+fh.setLevel(logging.DEBUG)
+fh.setFormatter(formatter)
+logger.addHandler(fh)
 
 class DummyDDPWrapper(nn.Module):
     def __init__(self, module):
@@ -58,6 +64,16 @@ def get_batch(ngram_data, batch_size, sample=True, device=torch.device('cuda')):
     ngram_instance_length = len(ngram_data['spans'])
     indices = np.arange(len(ngram_data['spans']))
 
+    # check for corrupted samples
+    spans = np.array(ngram_data['spans'])
+    remove = np.where(((spans[:, 1] - spans[:, 0]) < 1) | (spans[:, 1] > ngram_data['text']['input_ids'].shape[-1]))[0]
+    if remove.shape[0] > 0:
+        indices = indices[~remove]
+        logger.info(f"Found corrupted ngrams {ngram_data['ngrams']}")
+
+    if indices.shape[0] < 4:
+        return None
+
     if sample:
         np.random.shuffle(indices)
     indices = indices[:batch_size]
@@ -87,31 +103,45 @@ def evaluate(model, batch_path, device, args, global_step, writer=None):
     model.eval()
     with torch.no_grad():
         eval_data = torch.load(batch_path)
-        total_samples, total_loss = 0, 0
+        total_samples, total_loss, total_shape = 0, 0, 0
         text_loss, cont_loss = 0, 0
+        text_acc, audio_acc = 0, 0
         for batch in eval_data:
             batch_inputs = get_batch(batch, args.batch_size, sample=False, device=device)
+            if batch_inputs is None:
+                continue
 
             # calculate loss
             with torch.cuda.amp.autocast(enabled=args.no_amp):
                 outputs = model(batch_inputs['text'], batch_inputs['audio'], batch_inputs['spans'])
 
             total_loss += outputs['loss'].item()
+
             cont_loss += outputs['loss_contrastive'].item()
             text_loss += outputs['loss_text'].item()
+
+            text_acc += outputs['text_acc'].item()
+            audio_acc += outputs['audio_acc'].item()
+
+            total_shape += batch_inputs['spans'].shape[0]
             total_samples += 1
 
     total_loss /= total_samples
     cont_loss /= total_samples
     text_loss /= total_samples
 
+    text_acc /= total_shape
+    audio_acc /= total_shape
+
     if writer is not None:
         writer.add_scalar(f'{batch_path.replace("/", "-")}/loss', total_loss, global_step)
-        writer.add_scalar(f'{batch_path.replace("/", "-")}/text-loss', cont_loss, global_step)
-        writer.add_scalar(f'{batch_path.replace("/", "-")}/cont-loss', text_loss, global_step)
+        writer.add_scalar(f'{batch_path.replace("/", "-")}/text-loss', text_loss, global_step)
+        writer.add_scalar(f'{batch_path.replace("/", "-")}/cont-loss', cont_loss, global_step)
+        writer.add_scalar(f'{batch_path.replace("/", "-")}/text-acc', text_acc, global_step)
+        writer.add_scalar(f'{batch_path.replace("/", "-")}/audio-acc', audio_acc, global_step)
 
     logger.info("Finished evaluation")
-    logger.info(f'| step {global_step:0>6} | loss {total_loss:5.2f} |')
+    logger.info(f'| step {global_step:0>6} | loss {total_loss:5.2f} | closs {cont_loss:5.2f} | tloss {text_loss:5.2f} | t_acc {text_acc:5.2f} | a_acc {audio_acc:5.2f} |')
 
     return total_loss
 
@@ -131,20 +161,25 @@ def train(model, batch_path, optimizer, scaler, args, global_step=0, writer=None
 
     model.train()
     losses, grad_history = [], []
-    total_loss, minibatch = 0, 0
+    total_loss, minibatch, temp_size = 0, 0, 0
     text_loss, cont_loss = 0, 0
-    with model.join(), torch.profiler.profile(
-        schedule=torch.profiler.schedule(wait=2, warmup=4, active=4, repeat=2),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler('bin/log/profile'),
-        record_shapes=True,
-        with_stack=True) as prof:
+    text_acc, audio_acc = 0, 0
 
+    # with model.join(), torch.profiler.profile(
+    #     schedule=torch.profiler.schedule(wait=2, warmup=4, active=4, repeat=2),
+    #     on_trace_ready=torch.profiler.tensorboard_trace_handler('bin/log/lin-profile'),
+    #     record_shapes=True,
+    #     with_stack=True) as prof:
+
+    with model.join():
         for batch in train_data:
             # zero out gradients from last pass, this prevents gradient accumulation!
             model.zero_grad()
 
             # parse batch content into torch tensors on device.
-            batch_inputs = get_batch(batch, args.batch_size, sample=False, device=device)
+            batch_inputs = get_batch(batch, args.batch_size, device=device)
+            if batch_inputs is None:
+                continue
 
             # calculate loss
             with torch.cuda.amp.autocast(enabled=args.no_amp):
@@ -156,10 +191,10 @@ def train(model, batch_path, optimizer, scaler, args, global_step=0, writer=None
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
 
-            # calculate dynamic gradient clip threshold
             _norm = float(model.module._get_grad_norm())
             grad_norm = _norm if math.isfinite(_norm) else 0.0
 
+            # calculate dynamic gradient clip threshold
             # if not static_clip:
             #     grad_history.append(grad_norm)
             #     grad_history = grad_history[-history_size:]
@@ -176,20 +211,24 @@ def train(model, batch_path, optimizer, scaler, args, global_step=0, writer=None
             if lr_scheduler is not None:
                 lr_scheduler.step()
 
-            # update scaler's scale value and other parameters
+            # update scaler's scaling value
             scaler.update()
-            if scaler.get_scale() > 2.0**17:
-                scaler.update(2.0**18)
+            # if scaler.get_scale() > 2.0**17:
+            #     scaler.update(2.0**18)
 
             # profiling
-            prof.step()
+            # prof.step()
 
             total_loss += loss.item()
             cont_loss += outputs['loss_contrastive'].item()
             text_loss += outputs['loss_text'].item()
 
+            audio_acc += outputs['audio_acc'].item()
+            text_acc += outputs['text_acc'].item()
+
             minibatch += 1
             global_step += 1
+            temp_size += batch_inputs['spans'].shape[0]
 
             if minibatch % log_interval == 0:
                 total_loss = min(total_loss / log_interval, 1e1) # max loss value logged is 10 to prevent logging big values.
@@ -198,17 +237,31 @@ def train(model, batch_path, optimizer, scaler, args, global_step=0, writer=None
                 grad_norm /= log_interval
                 lr = optimizer.param_groups[0]['lr']
 
+                audio_acc /= temp_size
+                text_acc /= temp_size
+
                 if writer is not None and rank == 0:
                     writer.add_scalar('training/loss', total_loss, global_step)
-                    writer.add_scalar('training/text-loss', cont_loss, global_step)
-                    writer.add_scalar('training/cont-loss', text_loss, global_step)
+                    
+                    writer.add_scalar('training/text-loss', text_loss, global_step)
+                    writer.add_scalar('training/cont-loss', cont_loss, global_step)
+                    
+                    writer.add_scalar('training/audio-acc', audio_acc, global_step)
+                    writer.add_scalar('training/text-acc', text_acc, global_step)
+                    
                     writer.add_scalar('training/gnorm', grad_norm, global_step)
                     writer.add_scalar('training/scale', scaler.get_scale(), global_step)
                     writer.add_scalar('training/lr', lr, global_step)
 
-                logger.info(f'| rank = {rank} | global step = {global_step:0>6} | lr = {lr:2.6f} | loss = {total_loss:2.4f} | gnorm = {grad_norm:2.4f} |')
+                logger.info(f'| rank = {rank} | global step = {global_step:0>6} | lr = {lr:2.6f} | loss = {total_loss:2.4f} | closs = {cont_loss:2.4f} | tloss = {text_loss:2.4f} | t_acc = {text_acc:2.4f} | a_acc = {audio_acc:2.4f} | gnorm = {grad_norm:2.4f} |')
+                
                 total_loss = 0
+                text_loss = 0
+                cont_loss = 0
+                audio_acc = 0
+                text_acc = 0
                 grad_norm = 0
+                temp_size = 0
 
             if global_step >= max_steps:
                 return global_step
@@ -236,15 +289,20 @@ def main(args):
     	dropout=0.1,
     	activation="gelu"
     )
+
     no_params = sum(p.numel() for p in model.parameters())
 
     logger.info(f"Initialized AuBERT with text encoder: '{args.text_model}', and audio encoder: '{args.audio_model}'")
-    logger.info(f"No of parameters {no_params}")
+    logger.info(f"Total no of parameters {no_params}")
 
     model.to(device)
+    # Freeze model.audio_encoder.feature_extractor
+    for p in model.audio_encoder.model.feature_extractor.parameters():
+        p.requires_grad = False
+
     model = DummyDDPWrapper(model)
     scaler = torch.cuda.amp.GradScaler(enabled=args.no_amp)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.base_lr)
+    optimizer = torch.optim.Adagrad(model.parameters(), lr=args.base_lr)
     lr_scheduler = get_cosine_schedule_with_warmup(optimizer,
                                                     num_warmup_steps = args.warmup,
                                                     num_training_steps = args.max_steps,
@@ -261,7 +319,7 @@ def main(args):
 
     for epoch in range(args.epochs):
         random.shuffle(training_batches)
-        for batch_path in training_batches:
+        for i, batch_path in enumerate(training_batches):
             # global step is a counter of total update steps
             logger.info(f"Processing {batch_path}")
             global_step = train(
@@ -278,29 +336,32 @@ def main(args):
 
             logger.info(f"Global Step = {global_step:0>6} : finished batch {batch_path}")
 
+            if (i % args.eval_iters) == 0:
+                evaluate(model.module, args.val_dir, device, args, global_step, writer=writer)
+                torch.save(model.module.state_dict(), f"{args.checkpoint_path}_{global_step}.pt")
+
+            checkpoint = {
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scaler': scaler.state_dict(),
+                'scheduler': lr_scheduler.state_dict()
+            }
+
+            torch.save(checkpoint, args.checkpoint_path + "_last.ckpt")
             if global_step >= args.max_steps:
                 break
 
-        checkpoint = {
-            'model': model.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'scaler': scaler.state_dict(),
-            'scheduler': lr_scheduler.state_dict()
-        }
-
-        # model.module.save(args.checkpoint_path + f"_{global_step}")
-        torch.save(checkpoint, args.checkpoint_path + "_last.ckpt")
+        if global_step >= args.max_steps:
+            logger.info('Reached max global steps. Terminating...')
+            break
 
         evaluate(model.module, args.val_dir, device, args, global_step, writer=writer)
-        if args.test_dir:
-            evaluate(model.module, args.test_dir, device, args, global_step, writer=writer)
-
         logger.info("-"*60)
         logger.info(f"Finished epoch {epoch}")
         logger.info("-"*60)
 
-        if global_step >= args.max_steps:
-            break
+    if args.test_dir:
+        evaluate(model.module, args.test_dir, device, args, global_step, writer=writer)
 
 
 if __name__ == "__main__":
@@ -309,7 +370,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--base_lr", type=float, default=5e-5)
+    parser.add_argument("--base_lr", type=float, default=1e-3)
     parser.add_argument("--clip_value", type=float, default=1.0)
     parser.add_argument("--warmup", type=int, default=1000)
 
@@ -317,10 +378,11 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--no_amp", action="store_false")
 
-    parser.add_argument("--log_interval", type=int, default=10)
+    parser.add_argument("--log_interval", type=int, default=50)
     parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--max_steps", type=int, default=50000)
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--max_steps", type=int, default=150_000)
+    parser.add_argument("--eval_iters", type=int, default=20)
+    parser.add_argument("--batch_size", type=int, default=8)
 
     parser.add_argument("--train_dir", type=str, required=True)
     parser.add_argument("--val_dir", type=str, required=True)

@@ -130,7 +130,7 @@ optional arguments:
 Run training on a single batch:
 
 ```
-python -m aubert.trainer --train_dir bin/aubert-data/train/1.pt --val_dir bin/aubert-data/train/1.pt --epochs 50 
+python -m aubert.trainer --train_dir bin/aubert-data/train/1.pt --val_dir bin/aubert-data/train/1.pt --epochs 5
 ```
 
 
