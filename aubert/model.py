@@ -5,6 +5,7 @@ from transformers import AutoModel, AutoModelForMaskedLM
 import transformers
 import numpy as np
 
+
 class AuBERT(nn.Module):
     def __init__(
     	self, 
@@ -24,32 +25,34 @@ class AuBERT(nn.Module):
         # Source: https://github.com/openai/CLIP/blob/573315e83f07b53a61ff5098757e8fc885f1703e/clip/model.py#L291
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
         
+
     def forward(self, text, audio, spans, *args, **kwargs):
+
+        batch_size = spans.shape[0]
+
+        # Get audio and text representations
         text_encoding = self.text_encoder(spans=spans, **text, **kwargs)
         audio_encoding = self.audio_encoder(**audio, **kwargs)
-        
+
+        # Project to the same dimension
         text_features = self.text_projection(text_encoding)
         audio_features = self.audio_projection(audio_encoding)
         
-        # Normalize
+        # Apply L2 normalization
         text_features = F.normalize(text_features, dim=-1)
         audio_features = F.normalize(audio_features, dim=-1)
         scale = self.logit_scale.exp()
-        logits_per_text = scale * text_features @ audio_features.t()
-        
+        logits_per_text = scale * text_features @ audio_features.t() # B x B
         logits_per_audio = logits_per_text.t()
-        
-        device = logits_per_text.device
-        
+
         # Simple range
-        B = logits_per_text.size(0)
-        labels = torch.arange(B, device=device)
-        
+        device = logits_per_text.device
+        labels = torch.arange(batch_size, device=device)
+
         loss_t = F.cross_entropy(logits_per_text, labels)
         loss_a = F.cross_entropy(logits_per_audio, labels)
         
-        loss = (loss_a + loss_t)/2
-        
+        loss = (loss_a + loss_t) / 2
         return loss
 
     def _get_grad_norm(self):
@@ -60,6 +63,7 @@ class AuBERT(nn.Module):
                 total_norm += param_norm.item() ** 2
         total_norm = total_norm ** (1. / 2)
         return total_norm 
+
 
 class ProjectionHead(nn.Module):
     def __init__(
@@ -93,6 +97,7 @@ class ProjectionHead(nn.Module):
         x = self.layer_norm(x)
         return x
 
+
 class TextEncoder(nn.Module):
     def __init__(
         self, 
@@ -114,14 +119,15 @@ class TextEncoder(nn.Module):
             self.pool = Pooler(self.model.config.hidden_size, mode=pooling)
         
     def forward(self, spans=None, *args, **kwargs):
-        last_hiddens = self.model(*args,output_hidden_states=True, **kwargs).hidden_states[-1]
+        last_hiddens = self.model(*args, output_hidden_states=True, **kwargs).hidden_states[-1]
 
         if spans is None:
             return last_hiddens
         else:
             device = kwargs["input_ids"].device
             pooled_output = torch.cat([ self.pool(last_hiddens[i:i+1, b:e]) for i, (b, e) in enumerate(spans) ])
-            return pooled_output
+            return pooled_output # B x H
+
 
 class AudioEncoder(nn.Module):
     def __init__(
@@ -149,7 +155,8 @@ class AudioEncoder(nn.Module):
         
         pooled_output = self.pool(outputs)
         return pooled_output
-        
+
+
 class Pooler(nn.Module):
 
     def __init__(

@@ -125,13 +125,18 @@ def train(model, batch_path, optimizer, scaler, args, global_step=0, writer=None
     model.train()
     losses, grad_history = [], []
     total_loss, minibatch = 0, 0
-    with model.join():
+    with model.join(), torch.profiler.profile(
+        schedule=torch.profiler.schedule(wait=2, warmup=4, active=4, repeat=2),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler('bin/log/profile'),
+        record_shapes=True,
+        with_stack=True) as prof:
+
         for batch in train_data:
             # zero out gradients from last pass, this prevents gradient accumulation!
             model.zero_grad()
 
             # parse batch content into torch tensors on device.
-            batch_inputs = get_batch(batch, args.batch_size, device=device)
+            batch_inputs = get_batch(batch, args.batch_size, sample=False, device=device)
 
             # calculate loss
             with torch.cuda.amp.autocast(enabled=args.no_amp):
@@ -165,6 +170,9 @@ def train(model, batch_path, optimizer, scaler, args, global_step=0, writer=None
             scaler.update()
             if scaler.get_scale() > 2.0**17:
                 scaler.update(2.0**18)
+
+            # profiling
+            prof.step()
 
             total_loss += loss.item()
             minibatch += 1
