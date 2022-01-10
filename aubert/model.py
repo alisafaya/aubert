@@ -31,7 +31,7 @@ class AuBERT(nn.Module):
         batch_size = spans.shape[0]
 
         # Get audio and text representations
-        text_encoding = self.text_encoder(spans=spans, **text, **kwargs)
+        text_encoding, text_loss = self.text_encoder(spans=spans, **text, **kwargs)
         audio_encoding = self.audio_encoder(**audio, **kwargs)
 
         # Project to the same dimension
@@ -53,7 +53,13 @@ class AuBERT(nn.Module):
         loss_a = F.cross_entropy(logits_per_audio, labels)
         
         loss = (loss_a + loss_t) / 2
-        return loss
+
+        result_dict = {}
+        result_dict["loss_contrastive"] = loss
+        result_dict["loss_text"] = text_loss
+        result_dict["loss"] = text_loss + loss
+
+        return result_dict
 
     def _get_grad_norm(self):
         total_norm = 0
@@ -119,14 +125,19 @@ class TextEncoder(nn.Module):
             self.pool = Pooler(self.model.config.hidden_size, mode=pooling)
         
     def forward(self, spans=None, *args, **kwargs):
-        last_hiddens = self.model(*args, output_hidden_states=True, **kwargs).hidden_states[-1]
-
+        model_output = self.model(*args,output_hidden_states=True, **kwargs)
+        last_hiddens = model_output.hidden_states[-1]
+        loss = model_output.loss
         if spans is None:
-            return last_hiddens
+            return last_hiddens, loss
         else:
             device = kwargs["input_ids"].device
-            pooled_output = torch.cat([ self.pool(last_hiddens[i:i+1, b:e]) for i, (b, e) in enumerate(spans) ])
-            return pooled_output # B x H
+            
+            spans = torch.vstack([torch.arange(b, e, device=device) for b, e in spans])
+            span_representations = last_hiddens[torch.arange(len(spans), device=device).unsqueeze(1), spans]
+            
+            pooled_output = self.pool(span_representations)
+            return pooled_output, loss
 
 
 class AudioEncoder(nn.Module):
