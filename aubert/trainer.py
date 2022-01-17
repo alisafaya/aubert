@@ -19,7 +19,7 @@ import time
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
-formatter = logging.Formatter('%(asctime)s - %(message)s')
+formatter = logging.Formatter('%(asctime)s -%(levelname)s - %(message)s')
 
 handler = logging.StreamHandler(sys.stdout)
 handler.setLevel(logging.DEBUG)
@@ -59,7 +59,7 @@ def load_states_from_checkpoint(checkpoint, model=None, optimizer=None, scaler=N
         logger.info('Loaded scheduler checkpoint.')
 
 
-def get_batch(ngram_data, batch_size, sample=True, device=torch.device('cuda')):
+def get_batch(ngram_data, batch_size, sample=True, device=torch.device('cuda'), crop_audio=80000):
 
     ngram_instance_length = len(ngram_data['spans'])
     indices = np.arange(len(ngram_data['spans']))
@@ -69,7 +69,7 @@ def get_batch(ngram_data, batch_size, sample=True, device=torch.device('cuda')):
     remove = np.where(((spans[:, 1] - spans[:, 0]) < 1) | (spans[:, 1] > ngram_data['text']['input_ids'].shape[-1]))[0]
     if remove.shape[0] > 0:
         indices = indices[~remove]
-        logger.info(f"Found corrupted ngrams {ngram_data['ngrams']}")
+        logger.warning(f"Found corrupted ngrams {ngram_data['ngrams']}")
 
     if indices.shape[0] < 4:
         return None
@@ -78,18 +78,22 @@ def get_batch(ngram_data, batch_size, sample=True, device=torch.device('cuda')):
         np.random.shuffle(indices)
     indices = indices[:batch_size]
 
+    audio_shape = ngram_data['audio']['input_values'].shape[-1]
+    if audio_shape > crop_audio:
+        logger.warning(f'Cropping the audio of {(audio_shape / 16000)} secs. Original length is {audio_shape}, cropped to {(crop_audio / 16000)}. Ngram: {ngram_data["ngrams"]}')
+
     batch = {
         'spans': np.array(ngram_data['spans'])[indices],
         'ngrams': ngram_data['ngrams'],
         'audio': {
-            'input_values': torch.from_numpy(ngram_data['audio']['input_values'][indices]).to(device),
-            'attention_mask': torch.from_numpy(ngram_data['audio']['attention_mask'][indices]).int().to(device)
+            'input_values': torch.from_numpy(ngram_data['audio']['input_values'][indices])[:, :crop_audio].to(device),
+            'attention_mask': torch.from_numpy(ngram_data['audio']['attention_mask'][indices]).int()[:, :crop_audio].to(device)
         },
         'text': {
             'input_ids': torch.from_numpy(ngram_data['text']['input_ids'][indices]).long().to(device),
             'attention_mask': torch.from_numpy(ngram_data['text']['attention_mask'][indices]).long().to(device),
             'token_type_ids': torch.from_numpy(ngram_data['text']['token_type_ids'][indices]).long().to(device),
-            'labels': torch.from_numpy(ngram_data['text']['labels'][indices]).long().to(device)
+            # 'labels': torch.from_numpy(ngram_data['text']['labels'][indices]).long().to(device)
         }
     }
 
@@ -181,31 +185,41 @@ def train(model, batch_path, optimizer, scaler, args, global_step=0, writer=None
             if batch_inputs is None:
                 continue
 
-            # calculate loss
-            with torch.cuda.amp.autocast(enabled=args.no_amp):
-                outputs = model(batch_inputs['text'], batch_inputs['audio'], batch_inputs['spans'])
+            try:
+                # calculate loss
+                with torch.cuda.amp.autocast(enabled=args.no_amp):
+                    outputs = model(batch_inputs['text'], batch_inputs['audio'], batch_inputs['spans'])
 
-            loss = outputs['loss']
+                loss = outputs['loss']
 
-            # do backward pass
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
+                # do backward pass
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
 
-            _norm = float(model.module._get_grad_norm())
-            grad_norm = _norm if math.isfinite(_norm) else 0.0
+                _norm = float(model.module._get_grad_norm())
+                grad_norm = _norm if math.isfinite(_norm) else 0.0
 
-            # calculate dynamic gradient clip threshold
-            # if not static_clip:
-            #     grad_history.append(grad_norm)
-            #     grad_history = grad_history[-history_size:]
-            #     clip_value = np.mean(grad_history)  
+                # calculate dynamic gradient clip threshold
+                # if not static_clip:
+                #     grad_history.append(grad_norm)
+                #     grad_history = grad_history[-history_size:]
+                #     clip_value = np.mean(grad_history)  
 
-            # clip gradients
-            if clip_value != -1:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_value)
+                # clip gradients
+                if clip_value != -1:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), clip_value)
 
-            # update weights
-            scaler.step(optimizer)
+                # update weights
+                scaler.step(optimizer)
+            except RuntimeError as e:
+                logger.error(str(e))
+                logger.error(f"Ngram: {batch_inputs['ngrams']}")
+                for k in batch_inputs['text']:
+                    logger.error("Text input shapes: %s -> %s"%(k, str(batch_inputs['text'][k].shape), ))
+                for k in batch_inputs['audio']:
+                    logger.error("Audio input shapes: %s -> %s"%(k, str(batch_inputs['audio'][k].shape), ))
+
+                continue
 
             # if lr scheduler is used
             if lr_scheduler is not None:
@@ -379,9 +393,9 @@ if __name__ == "__main__":
     parser.add_argument("--no_amp", action="store_false")
 
     parser.add_argument("--log_interval", type=int, default=50)
-    parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--max_steps", type=int, default=150_000)
-    parser.add_argument("--eval_iters", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--max_steps", type=int, default=250_000)
+    parser.add_argument("--eval_iters", type=int, default=5)
     parser.add_argument("--batch_size", type=int, default=8)
 
     parser.add_argument("--train_dir", type=str, required=True)

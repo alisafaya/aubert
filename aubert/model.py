@@ -29,7 +29,7 @@ class AuBERT(nn.Module):
     def forward(self, text, audio, spans, *args, **kwargs):
 
         batch_size = spans.shape[0]
-
+    
         # Get audio and text representations
         text_encoding, text_loss = self.text_encoder(spans=spans, **text, **kwargs)
         audio_encoding = self.audio_encoder(**audio, **kwargs)
@@ -63,7 +63,7 @@ class AuBERT(nn.Module):
         result_dict = {}
         result_dict["loss_contrastive"] = loss
         result_dict["loss_text"] = text_loss
-        result_dict["loss"] = text_loss + loss
+        result_dict["loss"] = loss # + text_loss
         result_dict["audio_acc"] = a_acc
         result_dict["text_acc"] = t_acc
 
@@ -86,7 +86,7 @@ class ProjectionHead(nn.Module):
         projection_dim,
         dropout,
         activation="gelu",
-        linear=False
+        linear=True
     ):
         super(ProjectionHead, self).__init__()
         self.projection = nn.Linear(embedding_dim, projection_dim)
@@ -135,13 +135,13 @@ class TextEncoder(nn.Module):
     def forward(self, spans=None, *args, **kwargs):
         model_output = self.model(*args,output_hidden_states=True, **kwargs)
         last_hiddens = model_output.hidden_states[-1] # output of the final layer of the text encoder model.
-        loss = model_output.loss
+        # loss = model_output.loss
 
         if spans is None:
-            return last_hiddens, loss
+            return last_hiddens, "loss"
         else:
             pooled_output = torch.cat([ self.pool(last_hiddens[i:i+1, b:e]) for i, (b, e) in enumerate(spans) ])
-            return pooled_output, loss
+            return pooled_output, torch.tensor([1.])
 
 
 class AudioEncoder(nn.Module):
