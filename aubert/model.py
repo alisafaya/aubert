@@ -13,14 +13,15 @@ class AuBERT(nn.Module):
     	audio_model, 
     	proj_dim=256,
     	dropout=0.1,
+        linear=True,
     	activation="relu"
     ):
 
         super(AuBERT, self).__init__()
         self.text_encoder = TextEncoder(text_model)
-        self.text_projection = ProjectionHead(self.text_encoder.model.config.hidden_size, proj_dim, dropout, activation)
+        self.text_projection = ProjectionHead(self.text_encoder.model.config.hidden_size, proj_dim, dropout, activation, linear)
         self.audio_encoder = AudioEncoder(audio_model)
-        self.audio_projection = ProjectionHead(self.audio_encoder.model.config.hidden_size, proj_dim, dropout, activation)
+        self.audio_projection = ProjectionHead(self.audio_encoder.model.config.hidden_size, proj_dim, dropout, activation, linear)
         
         # Source: https://github.com/openai/CLIP/blob/573315e83f07b53a61ff5098757e8fc885f1703e/clip/model.py#L291
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
@@ -66,6 +67,8 @@ class AuBERT(nn.Module):
         result_dict["loss"] = loss # + text_loss
         result_dict["audio_acc"] = a_acc
         result_dict["text_acc"] = t_acc
+        result_dict["logits_per_text"] = logits_per_text
+        result_dict["logits_per_audio"] = logits_per_audio
 
         return result_dict
 
