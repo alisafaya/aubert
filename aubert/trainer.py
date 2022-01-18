@@ -12,7 +12,6 @@ import numpy as np
 import torch.nn as nn
 
 from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
-from tensorboardX import SummaryWriter
 
 import time
 
@@ -26,10 +25,6 @@ handler.setLevel(logging.DEBUG)
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
-fh = logging.FileHandler(f'bin/logs/trainer_{time.time()}.log')
-fh.setLevel(logging.DEBUG)
-fh.setFormatter(formatter)
-logger.addHandler(fh)
 
 class DummyDDPWrapper(nn.Module):
     def __init__(self, module):
@@ -284,6 +279,13 @@ def train(model, batch_path, optimizer, scaler, args, global_step=0, writer=None
 
 
 def main(args):
+
+    from tensorboardX import SummaryWriter
+
+    fh = logging.FileHandler(f'bin/logs/trainer_{time.time()}.log')
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
 
     device = torch.device(args.device)
     training_batches = glob(args.train_dir)
